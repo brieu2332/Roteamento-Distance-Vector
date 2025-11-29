@@ -57,6 +57,8 @@ class DVRouter(DVRouterBase):
         # This is the table that contains all current routes
         self.table = Table()
         self.table.owner = self
+        
+        self.history = {}
 
         ##### Begin Stage 10A #####
 
@@ -78,10 +80,15 @@ class DVRouter(DVRouterBase):
         assert port in self.ports.get_all_ports(), "Link should be up, but is not."
 
         ##### Begin Stage 1 #####
-        latencia = self.ports.get_latency(port)
+        # 1. Descobrimos a latência dessa porta
+        latency = self.ports.get_latency(port)
 
-        self.table[host] = TableEntry(dst=host, port=port, latency=latencia, expire_time=FOREVER)
+        self.table[host] = TableEntry(dst=host, port=port, latency=latency, expire_time=FOREVER)
+        # DEBUG: Vamos ver se isso está rodando!
+        print(f"DEBUG: Adicionando rota estática para {host} na porta {port} com latência {latency}")
+
         ##### End Stage 1 #####
+
 
     def handle_data_packet(self, packet, in_port):
         """
@@ -117,9 +124,26 @@ class DVRouter(DVRouterBase):
         """
 
         ##### Begin Stages 3, 6, 7, 8, 10 #####
-        for port in self.ports.get_all_ports():
+        ports_to_send = [single_port] if single_port else self.ports.get_all_ports()
+
+        for port in ports_to_send:
             for host, entry in self.table.items():
-                self.send_route(port, host, entry.latency)
+                latency_out = entry.latency
+
+                if self.SPLIT_HORIZON and entry.port == port:
+                    continue
+                if self.POISON_REVERSE and entry.port == port:
+                    latency_out = INFINITY
+                if latency_out > INFINITY:
+                    latency_out = INFINITY
+
+                history_port = self.history.get(port, {})
+                last_latency = history_port.get(host)
+                if force or latency_out != last_latency:
+                    self.send_route(port, host, latency_out)
+                    if port not in self.history:
+                        self.history[port] = {}
+                    self.history[port][host] = latency_out                 
         ##### End Stages 3, 6, 7, 8, 10 #####
 
     def expire_routes(self):
@@ -134,7 +158,15 @@ class DVRouter(DVRouterBase):
 
         for host, entry in self.table.items():
             if entry.expire_time <= current_time and entry.expire_time != FOREVER:
-                hosts_to_remove.append(host)
+                if self.POISON_EXPIRED and entry.latency < INFINITY:
+                    self.table[host] = TableEntry(
+                        dst=entry.dst,
+                        port=entry.port,
+                        latency=INFINITY,
+                        expire_time=current_time + self.ROUTE_TTL
+                    )
+                else:
+                    hosts_to_remove.append(host)
 
         for host in hosts_to_remove:
             self.table.pop(host)
@@ -160,22 +192,21 @@ class DVRouter(DVRouterBase):
             should_update = True
         else:
             current_entry = self.table[route_dst]
-            
             if current_entry.port == port:
                 should_update = True
-                
             elif new_latency < current_entry.latency:
                 should_update = True
-
         if should_update:
             expire_time = api.current_time() + self.ROUTE_TTL
-            
             self.table[route_dst] = TableEntry(
                 dst=route_dst, 
                 port=port, 
                 latency=new_latency, 
                 expire_time=expire_time
             )
+            
+        self.send_routes(force=False)
+        
         ##### End Stages 4, 10 #####
 
     def handle_link_up(self, port, latency):
@@ -189,7 +220,8 @@ class DVRouter(DVRouterBase):
         self.ports.add_port(port, latency)
 
         ##### Begin Stage 10B #####
-
+        if self.SEND_ON_LINK_UP:
+            self.send_routes(force=True, single_port=port)
         ##### End Stage 10B #####
 
     def handle_link_down(self, port):
@@ -202,7 +234,25 @@ class DVRouter(DVRouterBase):
         self.ports.remove_port(port)
 
         ##### Begin Stage 10B #####
+        hosts_modify = []
+        
+        for host, entry in self.table.items():
+            if entry.port == port:
+                hosts_modify.append(host)
 
+        if self.POISON_ON_LINK_DOWN:
+            for host in hosts_modify:
+                self.table[host] = TableEntry(
+                    dst=host,
+                    port=port,
+                    latency=INFINITY,
+                    expire_time=api.current_time() + self.ROUTE_TTL
+                )
+            self.send_routes(force=False)
+
+        else:
+            for host in hosts_modify:
+                self.table.pop(host)
         ##### End Stage 10B #####
 
     # Feel free to add any helper methods!
